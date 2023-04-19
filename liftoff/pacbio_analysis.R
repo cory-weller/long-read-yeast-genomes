@@ -1376,3 +1376,293 @@ par(mfrow = c(1, 1))
 par(mfrow = c(2, 3))
 for (x in c("25", "28", "32", "33", "L449M")) plot.growth.curve(c("MSp8", x), noparaquat, "t0", key.vec = sge1key.plate1.vector, yrange = c(0, 1.75), max.timepoint = 96*60/32.113744, time.interval = 32.113744, smooth = 0.0001, colors = c("#44444444", "orange"), title = x)
 par(mfrow = c(1,1))
+
+##########
+#Searching genome-wide for large-effect QTLs containing a large indel
+##########
+
+#MOVE THESE OBJECTS INTO THE RIGHT FOLDERS. 
+
+gene.positions <- read.delim(stringsAsFactors = F, header = F, "~/data/pacbio RR genomes/input/paf_files/gene_positions.tsv")
+colnames(gene.positions) <- c("orf", "gene", "chrom", "start", "end")
+gene.positions <- cbind.data.frame(name = sapply(1:nrow(gene.positions), function (x) if (gene.positions$gene[x] == "") gene.positions$orf[x] else gene.positions$gene[x]), 
+                                   gene.positions)
+gene.positions.by.chrom <- split(gene.positions, gene.positions$chrom)
+
+#Denoting insertions and deletions relative to the reference sequence from the cigar string
+cigar.mapped.to.target <- function (cigar, target.start = 1, query.start = 1, strand = c(1,-1)[1]) {
+  cigartable <- cbind.data.frame(class = strsplit(gsub('[0-9]+', '', cigar), "")[[1]], length = as.numeric(strsplit(cigar, "[IMD]")[[1]]))
+  start.end <- cbind.data.frame(stringsAsFactors = F, 
+                                start.in.target = numeric(nrow(cigartable)), 
+                                end.in.target = numeric(nrow(cigartable)),
+                                start.in.query =  numeric(nrow(cigartable)),
+                                end.in.query = numeric(nrow(cigartable)))
+  if (strand == 1) {
+    start.end[1,] <- c(target.start, 
+                       target.start + (cigartable$length[1] - 1),
+                       query.start,
+                       query.start +  (cigartable$length[1] - 1)) #This assumes the first row in cigartable with be of class M - seems fair? Seems to be true for all the cg values in the two paf files I looked at.
+    if (nrow(cigartable) > 1) {
+      for (x in 2:nrow(cigartable)) if (cigartable$class[x] == "M") {
+        start.end[x,] <- c(floor(start.end$end.in.target[x-1]) + 1, 
+                           floor(start.end$end.in.target[x-1]) + cigartable$length[x],
+                           floor(start.end$end.in.query[x-1]) + 1,
+                           floor(start.end$end.in.query[x-1]) + cigartable$length[x]) 
+      } else if (cigartable$class[x] == "I") {
+        start.end[x,] <- c(floor(start.end$end.in.target[x-1]) + 0.5, 
+                           floor(start.end$end.in.target[x-1]) + 0.5,
+                           floor(start.end$end.in.query[x-1]) + 1,
+                           floor(start.end$end.in.query[x-1]) + cigartable$length[x]) #I am denoting insertions as starting and ending "between" reference coordinates
+      } else if (cigartable$class[x] == "D") {
+        start.end[x,] <- c(floor(start.end$end.in.target[x-1]) + 1, 
+                           floor(start.end$end.in.target[x-1]) + cigartable$length[x],
+                           floor(start.end$end.in.query[x-1]) + 0.5,
+                           floor(start.end$end.in.query[x-1]) + 0.5)
+      }
+    }
+    cigar.coords <- cbind.data.frame(cigartable, start.end)
+  } else {
+    start.end[1,] <- c(target.start, 
+                       target.start - (cigartable$length[1] - 1),
+                       query.start,
+                       query.start +  (cigartable$length[1] - 1)) 
+    if (nrow(cigartable) > 1) {
+      for (x in 2:nrow(cigartable)) if (cigartable$class[x] == "M") {
+        start.end[x,] <- c(ceiling(start.end$end.in.target[x-1]) - 1, 
+                           ceiling(start.end$end.in.target[x-1]) - cigartable$length[x],
+                           floor(start.end$end.in.query[x-1]) + 1,
+                           floor(start.end$end.in.query[x-1]) + cigartable$length[x]) 
+      } else if (cigartable$class[x] == "I") {
+        start.end[x,] <- c(ceiling(start.end$end.in.target[x-1]) - 0.5, 
+                           ceiling(start.end$end.in.target[x-1]) - 0.5,
+                           floor(start.end$end.in.query[x-1]) + 1,
+                           floor(start.end$end.in.query[x-1]) + cigartable$length[x]) 
+      } else if (cigartable$class[x] == "D") {
+        start.end[x,] <- c(ceiling(start.end$end.in.target[x-1]) - 1, 
+                           ceiling(start.end$end.in.target[x-1]) - cigartable$length[x],
+                           floor(start.end$end.in.query[x-1]) + 0.5,
+                           floor(start.end$end.in.query[x-1]) + 0.5)
+      }
+    }
+    cigar.coords <- cbind.data.frame(cigartable, start.end)
+  }
+  cigar.coords <- transform(cigar.coords, class = as.character(class), length = as.numeric(length), start.in.target = as.numeric(start.in.target), end.in.target = as.numeric(end.in.target), start.in.query = as.numeric(start.in.query), end.in.query = as.numeric(end.in.query))
+  cigar.coords
+}
+
+#Taking multiple cigar strings for alignments from a single chromosome and finding all indels on the chromosome
+paf.chr.mapped.to.target <- function (paf.chr) {
+  paf.chr <- paf.chr[order(paf.chr$qstart),]
+  indel.tables <- lapply(1:nrow(paf.chr), function (x) {
+    cigar.mapped.to.target(cigar = paf.chr$cg[x],
+                           target.start = if (paf.chr$strand[x] == "+") paf.chr$tstart[x] else paf.chr$tend[x],
+                           query.start = paf.chr$qstart[x],
+                           strand = if (paf.chr$strand[x] == "+") 1 else -1)
+  })
+  for (i in 1:length(indel.tables)) {
+    indel.tables[[i]] <- cbind.data.frame(stringsAsFactors = F,
+                                          chrom = rep(paf.chr$tname[i], nrow(indel.tables[[i]])),
+                                          indel.tables[[i]])
+  }
+  master.table <- indel.tables[[1]]
+  if (length(indel.tables) > 1) {
+    DNA.contributions <- sapply(split(paf.chr$tend - paf.chr$tstart, paf.chr$tname), sum)
+    matched.chrom <- names(which.max(DNA.contributions))
+    matched.tables <- which(paf.chr$tname == matched.chrom)
+    for (x in 2:length(indel.tables)) {
+      if (indel.tables[[x]]$start.in.query[1] > (as.numeric(master.table$end.in.query[nrow(master.table)]) + 1)) {
+        master.table <- rbind.data.frame(master.table, 
+                                         c("novel", "I",
+                                           (as.numeric(indel.tables[[x]]$start.in.query[1]) - 1) - (as.numeric(master.table$end.in.query[nrow(master.table)]) + 1) + 1,
+                                           NA, NA,
+                                           as.numeric(master.table$end.in.query[nrow(master.table)]) + 1, 
+                                           as.numeric(indel.tables[[x]]$start.in.query[1]) - 1),
+                                         indel.tables[[x]])
+      } else {
+        if (!(x %in% matched.tables) || (((x - 1) %in% matched.tables) && (paf.chr$strand[x - 1] == "+"))) {
+          first.row <- max(which(as.numeric(indel.tables[[x]]$start.in.query) <= 1 + as.numeric(master.table$end.in.query[nrow(master.table)])))
+          overlap.length <- as.numeric(master.table$end.in.query[nrow(master.table)]) - as.numeric(indel.tables[[x]]$start.in.query[first.row]) + 1
+          master.table <- rbind.data.frame(master.table,
+                                           c(paf.chr$tname[x],
+                                             as.character(indel.tables[[x]]$class[first.row]),
+                                             indel.tables[[x]]$length[first.row] - overlap.length,
+                                             indel.tables[[x]]$start.in.target[first.row] + overlap.length * sign(indel.tables[[x]]$end.in.target[first.row] - indel.tables[[x]]$start.in.target[first.row]),
+                                             indel.tables[[x]]$end.in.target[first.row],
+                                             indel.tables[[x]]$start.in.query[first.row] + overlap.length,
+                                             indel.tables[[x]]$end.in.query[first.row]),
+                                           indel.tables[[x]][(first.row + 1):nrow(indel.tables[[x]]),])
+        } else {
+          last.row <- min(which(as.numeric(master.table$end.in.query) >= as.numeric(indel.tables[[x]]$start.in.query[1]) - 1))
+          overlap.length <- as.numeric(master.table$end.in.query[last.row]) - as.numeric(indel.tables[[x]]$start.in.query[1]) + 1
+          master.table <- rbind.data.frame(master.table[1:(last.row - 1),],
+                                           c(as.character(master.table$chrom[last.row]),
+                                             as.character(master.table$class[last.row]),
+                                             as.numeric(master.table$length[last.row]) - overlap.length,
+                                             as.numeric(master.table$start.in.target[last.row]),
+                                             as.numeric(master.table$end.in.target[last.row]) - overlap.length * sign(as.numeric(master.table$end.in.target[last.row]) - as.numeric(master.table$start.in.target[last.row])),
+                                             as.numeric(master.table$start.in.query[last.row]),
+                                             as.numeric(master.table$end.in.query[last.row]) - overlap.length),
+                                           indel.tables[[x]])
+        }
+      }
+    }
+  }
+  master.table <- cbind.data.frame(query.chrom = rep(paf.chr$qname[1], nrow(master.table)), master.table)
+  master.table <- transform(master.table, query.chrom = as.character(query.chrom), chrom = as.character(chrom), class = as.character(class), length = as.numeric(length), start.in.target = as.numeric(start.in.target), end.in.target = as.numeric(end.in.target), start.in.query = as.numeric(start.in.query), end.in.query = as.numeric(end.in.query))
+  master.table
+}
+
+#Going from the paf file to the insertion calls across the genome.
+paf.to.changes <- function(paf.file) {
+  #Read in the minimap2 .paf file
+  paf <- read_paf(paf.file) 
+  #Split by chromomsome
+  paf_by_chr <- split(paf, paf$qname)
+  changes <- lapply(paf_by_chr, function (x) paf.chr.mapped.to.target(x))
+  changes <- do.call("rbind", changes)
+  missing <- sapply(names(chrom.lengths), function (x) { #Currently, DNA is called as not missing if it is found anywhere in the genome; it doesn't have to be on the homologous chromosome.
+    mapped <- changes[which(changes$chrom == x), c(5,6)]
+    mapped <- t(apply(mapped, 1, function (x) c(min(x), max(x))))
+    mapped[,2] <- mapped[,2] + 1
+    interval_complement(Intervals(rbind(c(-Inf, 0), mapped, c(chrom.lengths[x], Inf))))
+  })
+  missing.df <- lapply(1:length(missing), function (x) {
+    cbind.data.frame(stringsAsFactors = F,
+                     query.chrom = rep(NA, nrow(missing[[x]])),
+                     chrom = rep(names(missing)[x], nrow(missing[[x]])),
+                     class = rep("D", nrow(missing[[x]])),
+                     length = apply(missing[[x]], 1, function (y) y[2] - y[1]),
+                     start.in.target = missing[[x]][,1],
+                     end.in.target = missing[[x]][,2],
+                     start.in.query = rep(NA, nrow(missing[[x]])),
+                     end.in.query = rep(NA, nrow(missing[[x]])))
+  })
+  missing.df <- do.call("rbind", missing.df)
+  changes <- rbind(changes, missing.df)
+  changes
+}
+
+ref.alignments <- list()
+
+#paf files were made on biowulf with minimap2 -csd --secondary=no [ref.fasta] [query.fasta] > [query.paf]
+
+for (x in 1:16) {
+  ref.alignments[[x]] <- paf.to.changes(paste0("~/data/pacbio RR genomes/input/paf_files/MSY", x + 23, ".paf", collapse = ""))
+}
+
+for (x in 1:16) names(ref.alignments)[x] <- paste0("MSY", x + 23, collapse = "")
+
+for (x in 1:16) ref.alignments[[x]] <- cbind.data.frame(stringsAsFactors = F, ref.alignments[[x]], ID = paste0("MSY", x + 23, "_", 1:nrow(ref.alignments[[x]])))
+
+save(ref.alignments, file = "~/data/pacbio RR genomes/output/ref.alignments.R")
+load("~/data/pacbio RR genomes/output/ref.alignments.R")
+
+alignment.intervals.in.region <- function (strain,
+                                           chrom, 
+                                           start, 
+                                           end, 
+                                           ref.intervals = TRUE,
+                                           alignment.object = ref.alignments[[grep(strain, names(ref.alignments), ignore.case = T)]]) {
+  if (ref.intervals == TRUE) {
+    alignments.chr <- alignment.object[which(alignment.object$chrom == chrom),]
+    alignments.chr.intervals <- t(apply(alignments.chr[,c("start.in.target","end.in.target")], 1, function (x) c(min(x), max(x))))
+    alignments.chr[interval_overlap(Intervals(c(start, end)), Intervals(alignments.chr.intervals))[[1]],]
+  } else {
+    alignments.chr <- alignment.object[which(alignment.object$query.chrom == chrom),]
+    alignments.chr[interval_overlap(Intervals(c(start, end)), Intervals(alignments.chr[,c("start.in.query","end.in.query")]))[[1]],]
+  }
+}
+
+compare.indels.in.qtl.interval <- function (qtl.number, qtl.padding = 0) {
+  qtl.chrom <- qtl.table$pmarker[qtl.number]
+  genes.in.qtl <- ""
+  genes.in.qtl.index <- interval_overlap(Intervals(c(qtl.table$GR.start[qtl.number] - qtl.padding, qtl.table$GR.end[qtl.number] + qtl.padding)), 
+                                         Intervals(gene.positions.by.chrom[[qtl.chrom]][,c("start", "end")]))[[1]]
+  if (length(genes.in.qtl.index)) {
+    genes.in.qtl <- paste(gene.positions.by.chrom[[qtl.chrom]]$name[genes.in.qtl.index], collapse = " ")
+  }
+  strains <- strsplit(qtl.table$cross[qtl.number], "_")[[1]]
+  strain1.intervals <- alignment.intervals.in.region(strains[1], 
+                                                     qtl.chrom, 
+                                                     qtl.table$GR.start[qtl.number] - qtl.padding,
+                                                     qtl.table$GR.end[qtl.number] + qtl.padding)
+  strain2.intervals <- alignment.intervals.in.region(strains[2], 
+                                                     qtl.chrom, 
+                                                     qtl.table$GR.start[qtl.number] - qtl.padding,
+                                                     qtl.table$GR.end[qtl.number] + qtl.padding)
+  strain1.indels <- strain1.intervals[which(strain1.intervals$class %in% c("D", "I")),]
+  strain2.indels <- strain2.intervals[which(strain2.intervals$class %in% c("D", "I")),]
+  unique.indels.1 <- numeric(0)
+  if (nrow(strain1.indels) > 0) {
+    genes.in.indels <- character(nrow(strain1.indels))
+    for (x in 1:nrow(strain1.indels)) {
+      if (strain1.indels$start.in.target[x] %in% strain2.indels$start.in.target) {
+        strain2.possible.match <- grep(strain1.indels$start.in.target[x], strain2.indels$start.in.target)
+        if (!((strain1.indels$length[x] == strain2.indels$length[strain2.possible.match]) &&
+              (strain1.indels$end.in.target[x] == strain2.indels$end.in.target[strain2.possible.match]))) {
+          unique.indels.1 <- c(unique.indels.1, x)
+        }
+      } else unique.indels.1 <- c(unique.indels.1, x)
+      genes.in.indel.indices <- interval_overlap(Intervals(sort(c(strain1.indels$start.in.target[x], strain1.indels$end.in.target[x]))), 
+                                                 Intervals(gene.positions.by.chrom[[qtl.chrom]][,c("start", "end")]))[[1]]
+      if (length(genes.in.indel.indices)) {
+        genes.in.indels[x] <- paste(gene.positions.by.chrom[[qtl.chrom]]$name[genes.in.indel.indices], collapse = " ")
+      }
+    }
+    strain1.indels <- cbind.data.frame(strain1.indels, 
+                                       trait = rep(qtl.table$trait[qtl.number], nrow(strain1.indels)),
+                                       LOD = rep(qtl.table$LOD[qtl.number], nrow(strain1.indels)),
+                                       qtl = rep(qtl.number, nrow(strain1.indels)),
+                                       qtl.width = rep(qtl.table$GR.width[qtl.number], nrow(strain1.indels)),
+                                       qtl.left = rep(qtl.table$GR.start[qtl.number], nrow(strain1.indels)),
+                                       qtl.right = rep(qtl.table$GR.end[qtl.number], nrow(strain1.indels)),
+                                       cross = rep(qtl.table$cross[qtl.number], nrow(strain1.indels)),
+                                       strain = rep(strains[1], nrow(strain1.indels)),
+                                       allele.effect = rep(if (qtl.table$r[qtl.number] > 0) -1 else 1, nrow(strain1.indels)),
+                                       genes.near.qtl = rep(genes.in.qtl, nrow(strain1.indels)),
+                                       genes.in.indel = genes.in.indels)
+  }
+  unique.indels.2 <- numeric(0)
+  if (nrow(strain2.indels) > 0) {
+    genes.in.indels <- character(nrow(strain2.indels))
+    for (x in 1:nrow(strain2.indels)) {
+      if (strain2.indels$start.in.target[x] %in% strain1.indels$start.in.target) {
+        strain1.possible.match <- grep(strain2.indels$start.in.target[x], strain1.indels$start.in.target)
+        if (!((strain2.indels$length[x] == strain1.indels$length[strain1.possible.match]) &&
+              (strain2.indels$end.in.target[x] == strain1.indels$end.in.target[strain1.possible.match]))) {
+          unique.indels.2 <- c(unique.indels.2, x)
+        }
+      } else unique.indels.2 <- c(unique.indels.2, x)
+      genes.in.indel.indices <- interval_overlap(Intervals(sort(c(strain2.indels$start.in.target[x], strain2.indels$end.in.target[x]))), 
+                                                 Intervals(gene.positions.by.chrom[[qtl.chrom]][,c("start", "end")]))[[1]]
+      if (length(genes.in.indel.indices)) {
+        genes.in.indels[x] <- paste(gene.positions.by.chrom[[qtl.chrom]]$name[genes.in.indel.indices], collapse = " ")
+      }
+    }
+    strain2.indels <- cbind.data.frame(strain2.indels, 
+                                       trait = rep(qtl.table$trait[qtl.number], nrow(strain2.indels)),
+                                       LOD = rep(qtl.table$LOD[qtl.number], nrow(strain2.indels)),
+                                       qtl = rep(qtl.number, nrow(strain2.indels)),
+                                       qtl.width = rep(qtl.table$GR.width[qtl.number], nrow(strain2.indels)),
+                                       qtl.left = rep(qtl.table$GR.start[qtl.number], nrow(strain2.indels)),
+                                       qtl.right = rep(qtl.table$GR.end[qtl.number], nrow(strain2.indels)),
+                                       cross = rep(qtl.table$cross[qtl.number], nrow(strain2.indels)),
+                                       strain = rep(strains[2], nrow(strain2.indels)),
+                                       allele.effect = rep(if (qtl.table$r[qtl.number] < 0) -1 else 1, nrow(strain2.indels)),
+                                       genes.near.qtl = rep(genes.in.qtl, nrow(strain2.indels)),
+                                       genes.in.indel = genes.in.indels)
+  }
+  rbind(strain1.indels[unique.indels.1,], strain2.indels[unique.indels.2,])
+}
+
+indels.in.LOD75.qtls <- do.call("rbind.data.frame", sapply(which(qtl.table$LOD > 75), function (x) compare.indels.in.qtl.interval(x, 500)))
+save(indels.in.LOD75.qtls, file = "~/data/pacbio RR genomes/output/indels.in.LOD75.qtls.R")
+load("~/data/pacbio RR genomes/output/indels.in.LOD75.qtls.R")
+#36 QTLs with LOD > 75 contain an indel of size > 250 bp. Across various traits. 
+length(which(sapply(split(indels.in.LOD75.qtls$length, indels.in.LOD75.qtls$qtl), max) > 250))
+#4 Copper QTLs are CUP1, 5 Lithium QTLs are ENA, 2 Galactose QTLs are PGM1, 6 Maltose QTLs are MAL1, 4 neomycin QTLs are the drug marker at the HO locus and thus aren't really natural variation (and one is caused by ENA, QTL 948).
+#One of the three cadmium QTLs is PCA1 (QTL 210)
+#HAP1 caused a cobalt QTL (qtl 4690), two fluconazole QTLs (qtls 4694 and 4697) and a zeocin QTL (4699).
+table(sapply(split(indels.in.LOD75.qtls$trait, indels.in.LOD75.qtls$qtl)[which(sapply(split(indels.in.LOD75.qtls$length, indels.in.LOD75.qtls$qtl), max) > 250)], function (x) x[1]))
+split(indels.in.LOD75.qtls[which(indels.in.LOD75.qtls$length > 250),], indels.in.LOD75.qtls$qtl[which(indels.in.LOD75.qtls$length > 250)])
+write.csv(indels.in.LOD75.qtls[which(indels.in.LOD75.qtls$length > 250),], file = "~/data/pacbio RR genomes/output/indels.over.250.bp.in.LOD75.qtls.csv", row.names = F)
